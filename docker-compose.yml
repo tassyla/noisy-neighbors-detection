@@ -1,26 +1,25 @@
-version: '3.8'
-
 services:
-	webapp:
-		build:
-			context: ./app
-		ports:
-			- "5000:5000"
+  webapp:
+    build:
+      context: ./app
+    ports:
+      - "5000:5000"
 
-	prometheus:
-		image: prom/prometheus:latest
-		volumes:
-			- ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-		ports:
-			- "9090:9090"
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
 
-	cadvisor:
-		image: gcr.io/cadvisor:latest
-		ports:
-			- "8080:8080"
-		volumes:
-			- /:/rootfs:ro
-			- /var/run:/var/run:ro
-			- /sys:/sys:ro
-			- /var/lib/docker/:/var/lib/docker:ro
+  cadvisor:
+    # Use the Docker Hub image to avoid gcr.io resolution/auth issues on some hosts
+    image: google/cadvisor:latest
+    ports:
+      - "8080:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
 
