@@ -12,14 +12,20 @@ services:
     ports:
       - "9090:9090"
 
-  cadvisor:
-    # Use the Docker Hub image to avoid gcr.io resolution/auth issues on some hosts
-    image: google/cadvisor:latest
-    ports:
-      - "8080:8080"
-    volumes:
-      - /:/rootfs:ro
-      - /var/run:/var/run:ro
-      - /sys:/sys:ro
-      - /var/lib/docker/:/var/lib/docker:ro
+# NOTE: cadvisor is disabled by default in this compose file because it often fails
+# on Windows/Docker Desktop (requires host cgroups mounts). To enable on a Linux
+# host, uncomment the block below and ensure the service runs with the required
+# volume mounts and privileges.
+#
+#  cadvisor:
+#    image: google/cadvisor:latest
+#    ports:
+#      - "8080:8080"
+#    volumes:
+#      - /:/rootfs:ro
+#      - /var/run:/var/run:ro
+#      - /sys:/sys:ro
+#      - /var/lib/docker/:/var/lib/docker:ro
+#    # Uncomment the following if your host requires privileged mode
+#    # privileged: true
 
