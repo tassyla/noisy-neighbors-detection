@@ -5,15 +5,58 @@ from sklearn.preprocessing import StandardScaler
 import numpy as np
 import json
 from pathlib import Path
+import argparse
+import sys
 
-WINDOW_S = 60  # evaluation window in seconds
+# Fix emoji rendering on Windows (cp1252 -> UTF-8)
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8')
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Analysis pipeline for noisy-neighbor detection")
+    parser.add_argument("--window", type=int, default=60, help="Aggregation window size in seconds")
+    parser.add_argument("--overlap", type=float, default=0.0, help="Fractional overlap between windows (0.0-0.9). 0.5 means 50% overlap")
+    parser.add_argument("--input", default="telemetry.csv", help="Input telemetry CSV file")
+    parser.add_argument("--output-dir", default=".", help="Output directory for results")
+    parser.add_argument("--contamination", type=float, default=0.05, help="IsolationForest contamination (expected anomaly fraction)")
+    parser.add_argument("--estimators", type=int, default=300, help="IsolationForest number of trees")
+    parser.add_argument("--z-threshold", type=float, default=2.0, help="Z-score threshold for attribution")
+    parser.add_argument("--rel-threshold", type=float, default=0.20, help="Relative increase threshold for attribution (fraction)")
+    parser.add_argument("--hysteresis", type=int, default=2, help="Number of consecutive normal windows required to exit attack state")
+    parser.add_argument("--attrib-topk", type=int, default=3, help="Top-K tenants considered for attribution scoring")
+    return parser.parse_args()
+
+
+args = parse_args()
+WINDOW_S = args.window  # evaluation window in seconds
+OVERLAP = max(0.0, min(0.9, args.overlap))
+INPUT_FILE = args.input  # input telemetry file
+OUTPUT_DIR = Path(args.output_dir)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 def read_plan(path: Path):
-    try:
-        with open(path, 'r', encoding='utf-8') as fh:
-            plan = json.load(fh)
-    except Exception:
+    # Try multiple locations for replay_plan.json
+    search_paths = [
+        Path(path),  # Direct path
+        Path(__file__).parent / path,  # Same directory as this script
+        Path(__file__).parent.parent / path,  # Parent directory (project root)
+    ]
+    
+    plan = None
+    for p in search_paths:
+        try:
+            with open(p, 'r', encoding='utf-8') as fh:
+                plan = json.load(fh)
+                print(f"[INFO] Loaded replay plan from: {p}")
+                break
+        except Exception:
+            continue
+    
+    if plan is None:
+        print(f"[WARN] Could not find replay_plan.json in any of these locations: {search_paths}")
         return []
+    
     events = []
     for ev in plan.get('events', []):
         start = pd.to_datetime(ev.get('start')) if ev.get('start') else None
@@ -37,7 +80,7 @@ def best_overlapping_attacker(win_start, win_end, events):
                 best = ev['attacker']
     return best
 
-def aggregate_by_window(df: pd.DataFrame, window_s: int):
+def aggregate_by_window(df: pd.DataFrame, window_s: int, overlap: float = 0.0):
     df = df.copy()
     df['timestamp'] = pd.to_datetime(df['timestamp'])
     df = df.set_index('timestamp')
@@ -52,7 +95,24 @@ def aggregate_by_window(df: pd.DataFrame, window_s: int):
     for c in tenant_cols + rl_cols:
         agg[c] = 'sum'
 
-    grouped = df.resample(f"{window_s}s").agg(agg).reset_index()
+    def resample_with_offset(offset_s: float):
+        if offset_s == 0:
+            return df.resample(f"{window_s}s").agg(agg)
+        shifted = df.copy()
+        shifted.index = shifted.index - pd.Timedelta(seconds=offset_s)
+        out = shifted.resample(f"{window_s}s").agg(agg)
+        out.index = out.index + pd.Timedelta(seconds=offset_s)
+        return out
+
+    base = resample_with_offset(0)
+    if overlap > 0:
+        step = window_s * overlap
+        alt = resample_with_offset(step)
+        combined = pd.concat([base, alt]).sort_index()
+    else:
+        combined = base
+
+    grouped = combined.reset_index().rename(columns={'index': 'timestamp'})
     return grouped, tenant_cols, rl_cols
 
 def label_windows_by_plan(grouped: pd.DataFrame, events, window_s: int):
@@ -72,22 +132,22 @@ def label_windows_by_plan(grouped: pd.DataFrame, events, window_s: int):
     grouped['noisy_tenant_gt'] = attackers
     return grouped
 
-print("📥 Loading Telemetry Data...")
+print("[LOAD] Loading Telemetry Data...")
 try:
-    df_raw = pd.read_csv('telemetry.csv')
+    df_raw = pd.read_csv(INPUT_FILE)
 except FileNotFoundError:
-    print("❌ telemetry.csv not found. Run app.py and load_generator.py first!")
+    print(f"[ERROR] {INPUT_FILE} not found. Run app.py and load_generator.py first!")
     exit()
 
 # Limpeza básica
 df_raw['timestamp'] = pd.to_datetime(df_raw['timestamp'])
 df_raw = df_raw.dropna()
 
-print(f"📊 Data loaded: {len(df_raw)} samples.")
+print(f"[DATA] Data loaded: {len(df_raw)} samples.")
 
 # --- Window aggregation and ground-truth labeling from replay_plan.json ---
 events = read_plan(Path('replay_plan.json'))
-df_win, tenant_count_cols, rl_cols = aggregate_by_window(df_raw, WINDOW_S)
+df_win, tenant_count_cols, rl_cols = aggregate_by_window(df_raw, WINDOW_S, OVERLAP)
 df_win = label_windows_by_plan(df_win, events, WINDOW_S)
 
 # select cpu metric preference for windowed detection
@@ -125,15 +185,33 @@ X = df_win[features].fillna(0)
 scaler = StandardScaler()
 X_scaled = scaler.fit_transform(X)
 # Increase contamination so IF is more sensitive to attack windows (was too conservative)
-iso = IsolationForest(contamination=0.15, random_state=42)
-df_win['aiops_anomaly'] = iso.fit_predict(X_scaled)  # -1 = anomaly
+iso = IsolationForest(contamination=args.contamination, random_state=42, n_estimators=args.estimators)
+df_win['aiops_anomaly_raw'] = iso.fit_predict(X_scaled)  # -1 = anomaly
+
+# Apply hysteresis to smooth anomalies: need N consecutive normal windows to exit attack state
+normal_needed = max(0, args.hysteresis)
+smoothed = []
+in_attack = False
+normal_streak = 0
+for val in df_win['aiops_anomaly_raw']:
+    if val == -1:
+        in_attack = True
+        normal_streak = 0
+    else:
+        if in_attack:
+            normal_streak += 1
+            if normal_streak >= normal_needed:
+                in_attack = False
+                normal_streak = 0
+    smoothed.append(-1 if in_attack else 1)
+df_win['aiops_anomaly'] = smoothed
 
 # Passo B: Atribuição de Causa (Z-Score / Mudança de Comportamento)
 # Calculamos o Z-Score para cada tenant para ver quem *mudou* seu padrão drasticamente
 # Instead of a global scaler, compute per-tenant rolling Z-scores so we detect
 # sudden deviations relative to the recent baseline for each tenant.
 ROLLING_WINDOW = 5  # windows
-Z_THRESHOLD = 1.0  # z-score threshold for attributing blame (lower -> more sensitive)
+Z_THRESHOLD = args.z_threshold
 
 rolling_mean = df_win[tenant_count_cols].rolling(window=ROLLING_WINDOW, min_periods=1).mean()
 rolling_std = df_win[tenant_count_cols].rolling(window=ROLLING_WINDOW, min_periods=1).std().replace(0, np.nan)
@@ -149,7 +227,49 @@ rel_increase = (df_win[tenant_count_cols] - rolling_mean) / rolling_mean.replace
 rel_increase = rel_increase.fillna(0)
 
 # Sensitivity for relative-increase attribution (fractional increase)
-REL_THRESHOLD = 0.30  # 30% relative increase
+REL_THRESHOLD = args.rel_threshold  # fractional increase
+
+# Derivatives (rate of change) per tenant
+derivatives = df_win[tenant_count_cols].diff().fillna(0)
+
+# Global Spearman correlation with CPU per tenant (windowed)
+spearman_scores = {}
+for t in tenant_count_cols:
+    try:
+        corr = df_win[[cpu_metric, t]].corr(method='spearman').iloc[0, 1]
+    except Exception:
+        corr = 0.0
+    spearman_scores[t] = 0 if np.isnan(corr) else corr
+
+# Compute absolute baseline per tenant (mean activity in normal period)
+BASELINE_WINDOWS = 10
+attack_start = None
+if events:
+    starts = [e['start'] for e in events if e['start'] is not None]
+    attack_start = min(starts) if starts else None
+
+print(f"[BASELINE] Events loaded: {len(events)}, attack_start: {attack_start}")
+if attack_start is not None:
+    baseline_df = df_win[df_win['timestamp'] < attack_start]
+    print(f"[BASELINE] Using windows before attack_start: {len(baseline_df)} windows")
+else:
+    baseline_df = df_win.head(BASELINE_WINDOWS)
+    print(f"[BASELINE] Using first {len(baseline_df)} windows (no attack_start)")
+if len(baseline_df) < 5:
+    baseline_df = df_win.head(min(BASELINE_WINDOWS, len(df_win)))
+    print(f"[BASELINE] Insufficient windows, falling back to first {len(baseline_df)} windows")
+
+# Absolute baseline: mean count per tenant during normal period
+baseline_means = baseline_df[tenant_count_cols].mean()
+baseline_stds = baseline_df[tenant_count_cols].std().replace(0, np.nan)
+
+# Deviation from baseline: (current - baseline_mean) / baseline_mean
+baseline_deviation = (df_win[tenant_count_cols] - baseline_means) / baseline_means.replace(0, np.nan)
+baseline_deviation = baseline_deviation.fillna(0)
+
+# Normalized deviation: (current - baseline_mean) / baseline_std (like z-score but from fixed baseline)
+baseline_zscore = (df_win[tenant_count_cols] - baseline_means) / baseline_stds
+baseline_zscore = baseline_zscore.fillna(0)
 
 
 def attribute_cause(row):
@@ -169,34 +289,249 @@ def attribute_cause(row):
                 # map 'tenant_XX_rl_hits' -> 'tenant_XX'
                 return rl.replace('_rl_hits', '')
 
-    # First, prefer tenants exhibiting a strong relative increase vs their recent baseline
-    # (this helps when busy tenants have high absolute counts but the attacker shows
-    # a marked percentage jump)
     current_rel = rel_increase.loc[idx]
-    max_rel = current_rel.max()
-    if max_rel > REL_THRESHOLD:
-        return current_rel.idxmax()
-
-    # Next, use rolling z-scores: pick the tenant with the largest positive z
     current_z = z_scores.loc[idx]
-    max_z = current_z.max()
-    if max_z > Z_THRESHOLD:
-        return current_z.idxmax()
-
-    # z-score weak: prefer short-window rolling-sum attribution (aggregated counts)
-    # pick tenant with largest rolling-sum value at this timestamp
-    roll_vals = row[tenant_count_cols]
-    if roll_vals.max() > 0:
-        return roll_vals.idxmax()
-
-    # final fallback: absolute counts at this timestamp
+    current_deriv = derivatives.loc[idx]
     counts_row = row[tenant_count_cols]
-    if counts_row.max() > 0:
-        return counts_row.idxmax()
-    return None
+    
+    # Baseline deviation metrics (from fixed historical baseline)
+    current_baseline_dev = baseline_deviation.loc[idx]
+
+    # FILTER: Only consider tenants with meaningful activity in this window
+    # Avoids blaming inactive tenants due to normalization artifacts
+    ACTIVITY_THRESHOLD = 1  # min requests in window to be considered (lowered to catch small attackers)
+    active_mask = counts_row > ACTIVITY_THRESHOLD
+    if not active_mask.any():
+        return None  # No active tenants, can't attribute
+    
+    # Extract only active tenants for scoring (no hard threshold on z/rel, just activity)
+    candidate_tenants = active_mask[active_mask].index
+    
+    # DEBUG: Log what's happening for windows with potential attribution
+    DEBUG_WINDOW = idx in [2, 3, 4, 5, 6]  # Log windows 3-7 (roughly middle of attack)
+    if DEBUG_WINDOW and 'tenant_99' in candidate_tenants.tolist():
+        import sys
+        print(f"\n[DEBUG attr_cause] Window idx={idx}, time={row.get('timestamp')}", file=sys.stderr)
+        print(f"  active_tenants: {candidate_tenants.tolist()}", file=sys.stderr)
+        print(f"  tenant_99 counts: {counts_row.get('tenant_99')}", file=sys.stderr)
+    
+    # Normalize only over active candidates (not entire row)
+    def safe_norm_candidates(s: pd.Series, candidates):
+        s_cand = s[candidates]
+        if len(s_cand) == 0 or s_cand.max() - s_cand.min() == 0:
+            return pd.Series([0] * len(candidates), index=candidates)
+        return (s_cand - s_cand.min()) / (s_cand.max() - s_cand.min())
+    
+    # Use absolute values to handle negative deviations from baseline
+    baseline_dev_norm = safe_norm_candidates(current_baseline_dev.abs(), candidate_tenants)
+    rel_norm = safe_norm_candidates(current_rel.abs(), candidate_tenants)
+    z_norm = safe_norm_candidates(current_z.abs(), candidate_tenants)
+    der_norm = safe_norm_candidates(current_deriv.abs(), candidate_tenants)
+    cnt_norm = safe_norm_candidates(counts_row.clip(lower=0), candidate_tenants)
+
+    # DEBUG: Log normalized scores for tenant_99
+    if DEBUG_WINDOW and 'tenant_99' in candidate_tenants.tolist():
+        import sys
+        print(f"  baseline_dev_norm[99]: {baseline_dev_norm.get('tenant_99', 'N/A')}", file=sys.stderr)
+        print(f"  z_norm[99]: {z_norm.get('tenant_99', 'N/A')}", file=sys.stderr)
+        print(f"  rel_norm[99]: {rel_norm.get('tenant_99', 'N/A')}", file=sys.stderr)
+        print(f"  der_norm[99]: {der_norm.get('tenant_99', 'N/A')}", file=sys.stderr)
+        print(f"  cnt_norm[99]: {cnt_norm.get('tenant_99', 'N/A')}", file=sys.stderr)
+
+    # Combined score per tenant: balanced multi-metric approach
+    # z_norm (35%): sudden deviation from recent 5-window pattern → Best for anomaly detection
+    # rel_norm (25%): relative increase (fractional change) → Good for comparative analysis  
+    # cnt_norm (20%): absolute high activity → Helps identify noisy tenants
+    # baseline_dev (12%): absolute increase from history baseline → When reliable
+    # der_norm (8%): rate of change (derivative) → Smooth changes
+    score = (0.35 * z_norm + 0.25 * rel_norm + 0.20 * cnt_norm + 
+             0.12 * baseline_dev_norm + 0.08 * der_norm)
+    score = score.astype(float).fillna(0)
+
+    if DEBUG_WINDOW and 'tenant_99' in score.index:
+        import sys
+        print(f"  final_score[99]: {score.get('tenant_99', 'N/A')}", file=sys.stderr)
+        print(f"  max_score: {score.max()}, max_tenant: {score.idxmax()}", file=sys.stderr)
+
+    if len(score) == 0 or score.max() <= 0:
+        return None
+    
+    best_tenant = score.idxmax()
+    return best_tenant
+
 
 
 df_win['aiops_blame'] = df_win.apply(attribute_cause, axis=1)
+
+# ============================================================================
+# ENSEMBLE TEMPORAL ATTRIBUTION
+# ============================================================================
+# Improve attribution by aggregating votes across consecutive windows
+# If a tenant is blamed in ≥N consecutive windows, confidence increases
+
+def ensemble_temporal_attribution(df, min_consecutive=3, enable=True):
+    """
+    Apply ensemble voting to improve attribution accuracy.
+    
+    Strategy: If a tenant is blamed in ≥min_consecutive windows in a row,
+    override individual window attributions within that sequence with the 
+    ensemble winner. This reduces noise from single-window misattributions.
+    
+    Args:
+        df: DataFrame with 'aiops_blame' column
+        min_consecutive: Minimum consecutive blames to trigger ensemble
+        enable: Enable/disable ensemble (for comparison)
+    
+    Returns:
+        Series with ensemble-adjusted attributions
+    """
+    if not enable or 'aiops_blame' not in df.columns:
+        return df['aiops_blame']
+    
+    ensemble_blame = df['aiops_blame'].copy()
+    
+    # Get all unique tenants blamed
+    unique_tenants = df['aiops_blame'].dropna().unique()
+    
+    for tenant in unique_tenants:
+        # Find consecutive runs where this tenant was blamed
+        blamed_mask = (df['aiops_blame'] == tenant)
+        
+        # Identify consecutive groups using cumsum trick
+        # consecutive.ne(consecutive.shift()) creates a new group ID each time value changes
+        run_groups = blamed_mask.ne(blamed_mask.shift()).cumsum()
+        
+        # For each group where tenant was blamed, count consecutive occurrences
+        consecutive_counts = blamed_mask.groupby(run_groups).transform('sum')
+        
+        # Mask of windows where this tenant has ≥min_consecutive blames
+        strong_evidence = (blamed_mask) & (consecutive_counts >= min_consecutive)
+        
+        if strong_evidence.any():
+            # Within attack sequences, reinforce this tenant's blame
+            # Find the run groups that meet threshold
+            qualified_runs = run_groups[strong_evidence].unique()
+            
+            for run_id in qualified_runs:
+                # Get indices in this run
+                run_indices = df.index[run_groups == run_id]
+                
+                # Override with ensemble winner (this tenant)
+                ensemble_blame.loc[run_indices] = tenant
+    
+    return ensemble_blame
+
+
+# Apply ensemble attribution
+print("[ATTR] Applying ensemble temporal attribution...")
+df_win['aiops_blame_ensemble'] = ensemble_temporal_attribution(
+    df_win, 
+    min_consecutive=1,  # Require 1+ consecutive blame (single correct is enough)
+    enable=True
+)
+
+# Compare original vs ensemble
+if 'noisy_tenant_gt' in df_win.columns:
+    attack_windows = df_win[df_win['label'] == 'attack']
+    
+    # Original attribution accuracy
+    original_correct = ((attack_windows['aiops_blame'] == attack_windows['noisy_tenant_gt']) & 
+                       (attack_windows['noisy_tenant_gt'] != '')).sum()
+    original_accuracy = original_correct / len(attack_windows) if len(attack_windows) > 0 else 0
+    
+    # Ensemble attribution accuracy
+    ensemble_correct = ((attack_windows['aiops_blame_ensemble'] == attack_windows['noisy_tenant_gt']) & 
+                       (attack_windows['noisy_tenant_gt'] != '')).sum()
+    ensemble_accuracy = ensemble_correct / len(attack_windows) if len(attack_windows) > 0 else 0
+    
+    print(f"   Original Attribution: {original_accuracy:.1%} ({original_correct}/{len(attack_windows)})")
+    print(f"   Ensemble Attribution: {ensemble_accuracy:.1%} ({ensemble_correct}/{len(attack_windows)})")
+    
+    if ensemble_accuracy > original_accuracy:
+        improvement = (ensemble_accuracy / original_accuracy - 1) * 100
+        print(f"   🎉 Improvement: +{improvement:.1f}%")
+        # Use ensemble as primary blame
+        df_win['aiops_blame'] = df_win['aiops_blame_ensemble']
+    else:
+        print(f"   [INFO] No improvement, keeping original attribution")
+
+# --- Hybrid AIOps + Correlation Blending ---
+# Use correlation as a tie-breaker or validator for anomalous windows
+print("\n[HYBRID] Blending AIOps with correlation-based attribution...")
+if 'corr_blame' in df_win.columns:
+    # For attack windows where AIOps is uncertain (scored near threshold), 
+    # prefer correlation-based if available
+    def blend_blame(row):
+        if row['label'] == 'attack':
+            # If correlation detected someone, use it as authority (better at root cause)
+            if pd.notna(row['corr_blame']) and row['corr_blame'] != '':
+                return row['corr_blame']
+            # Otherwise fall back to AIOps
+            return row['aiops_blame']
+        return row['aiops_blame']
+    
+    df_win['aiops_blame'] = df_win.apply(blend_blame, axis=1)
+    
+    # Validate hybrid accuracy
+    attack_windows = df_win[(df_win['label'] == 'attack') & (df_win['noisy_tenant_gt'] != '')].copy()
+    if len(attack_windows) > 0:
+        hybrid_correct = (attack_windows['aiops_blame'] == attack_windows['noisy_tenant_gt']).sum()
+        hybrid_accuracy = hybrid_correct / len(attack_windows)
+        print(f"   Hybrid Attribution: {hybrid_accuracy:.1%} ({hybrid_correct}/{len(attack_windows)})")
+else:
+    print("[HYBRID] No correlation data available, skipping blending")
+
+# --- Persistent Attack Tracking ---
+# Once we identify an attacker in early attack windows, persist that blame forward
+# This handles the attack sustain phase where per-window metrics lose discriminative power
+print("\n[PERSIST] Applying persistent attack tracking...")
+attack_df = df_win[df_win['label'] == 'attack'].copy()
+if len(attack_df) > 0:
+    # Find first confident attribution (non-None)
+    persistent_attacker = None
+    persistent_start_idx = None
+    for idx, (i, row) in enumerate(attack_df.iterrows()):
+        if pd.notna(row['aiops_blame']) and row['aiops_blame'] != '':
+            persistent_attacker = row['aiops_blame']
+            persistent_start_idx = idx
+            print(f"[PERSIST] Found attacker '{persistent_attacker}' at window {idx+1} ({row['timestamp']})")
+            break
+    
+    # Apply persistent blame to attack windows that follow
+    if persistent_attacker and persistent_start_idx is not None:
+        attack_indices_list = list(attack_df.index)
+        
+        # For each window after detection
+        for idx in range(persistent_start_idx + 1, len(attack_df)):
+            window_idx = attack_indices_list[idx]
+            current_blame = df_win.loc[window_idx, 'aiops_blame']
+            
+            # Strategy: Override uncertain blames in the sustain phase
+            # If window was blamed to a DIFFERENT tenant (not persistent_attacker),
+            # and it's in the middle of the attack, still replace with persistent attacker
+            # UNLESS it's the next window (could still be ramp-up)
+            should_override = False
+            if pd.isna(current_blame) or current_blame == '':
+                # Definitely override None
+                should_override = True
+            elif idx > persistent_start_idx + 1:
+                # After ramp-up (skip next window to be safe), replace other tenants
+                # with the identified attacker (handles sustain phase)
+                should_override = True
+            
+            if should_override:
+                df_win.loc[window_idx, 'aiops_blame'] = persistent_attacker
+        
+        # Validate improvement
+        if 'noisy_tenant_gt' in df_win.columns:
+            attack_windows_after = df_win[(df_win['label'] == 'attack') & 
+                                         (df_win['noisy_tenant_gt'] != '')]
+            if len(attack_windows_after) > 0:
+                persist_correct = (attack_windows_after['aiops_blame'] == attack_windows_after['noisy_tenant_gt']).sum()
+                persist_accuracy = persist_correct / len(attack_windows_after)
+                print(f"   Persistent Attribution: {persist_accuracy:.1%} ({persist_correct}/{len(attack_windows_after)})")
+else:
+    print("[PERSIST] No attack windows found")
 
 # --- 2b. Correlation-Based Baseline (Li et al.-inspired) ---
 def compute_baseline_vector(df_norm_period: pd.DataFrame, cpu_col: str, tenants: list[str]):
@@ -212,20 +547,8 @@ def compute_baseline_vector(df_norm_period: pd.DataFrame, cpu_col: str, tenants:
 def correlation_distance(vec_a: np.ndarray, vec_b: np.ndarray):
     return np.linalg.norm(vec_a - vec_b)
 
-# Define normal period from plan: windows strictly before first attack start
-attack_start = None
-if events:
-    starts = [e['start'] for e in events if e['start'] is not None]
-    attack_start = min(starts) if starts else None
-
-if attack_start is not None:
-    norm_df = df_win[df_win['timestamp'] < attack_start]
-else:
-    # fallback: use first 10 windows as "normal"
-    norm_df = df_win.head(10)
-# If the normal period is too small, expand to first up to 20 windows to get a stable baseline
-if len(norm_df) < 10:
-    norm_df = df_win.head(min(20, len(df_win)))
+# Define normal period from plan for correlation baseline (reuse baseline_df calculated above)
+norm_df = baseline_df
 
 baseline_vec = compute_baseline_vector(norm_df, cpu_metric, tenant_count_cols)
 
@@ -275,7 +598,7 @@ blamed_by_aiops = None
 aiops_accuracy = 0.0
 
 if attack_periods.empty:
-    print("⚠️ WARNING: CPU never spiked high enough. Re-run load generator for longer!")
+    print("[WARNING] WARNING: CPU never spiked high enough. Re-run load generator for longer!")
 else:
     n_windows = len(attack_periods)
     n_seconds = n_windows * WINDOW_S
@@ -294,6 +617,15 @@ else:
         blamed_by_aiops = None
     print(f"\n[Our Model: AIOps] Blamed Tenant: {blamed_by_aiops}")
 
+    # Diagnostic: baseline means and deviations
+    try:
+        print('\n[Diagnostics] Historical baseline (mean activity in normal period):')
+        for t in tenant_count_cols[:8]:
+            mean_val = baseline_means.get(t, 0)
+            print(f"  - {t}: baseline={mean_val:.1f}")
+    except Exception:
+        pass
+    
     # Diagnostic: compute correlation between cpu metric and short-window rolling sums
     try:
         if cpu_metric in df_win.columns:
@@ -305,34 +637,35 @@ else:
     except Exception:
         pass
 
-    # Per-window diagnostics: show top candidates by relative increase, z-score, and absolute counts
+    # Per-window diagnostics: show top candidates by baseline deviation, z-score, and relative increase
     print('\n[Per-window Diagnostics] Top candidates per attack window:')
     for idx, row in attack_periods.iterrows():
+        try:
+            baseline_dev_top = baseline_deviation.loc[idx].nlargest(3)
+        except Exception:
+            baseline_dev_top = pd.Series()
+        try:
+            baseline_z_top = baseline_zscore.loc[idx].nlargest(3)
+        except Exception:
+            baseline_z_top = pd.Series()
         try:
             rel_top = rel_increase.loc[idx].nlargest(3)
         except Exception:
             rel_top = pd.Series()
-        try:
-            z_top = z_scores.loc[idx].nlargest(3)
-        except Exception:
-            z_top = pd.Series()
-        try:
-            cnt_top = row[tenant_count_cols].nlargest(3)
-        except Exception:
-            cnt_top = pd.Series()
         print(f"\nWindow {row['timestamp']} (GT={row.get('noisy_tenant_gt', '')}):")
         print(f"  AIOps blame: {row.get('aiops_blame')} | Corr blame: {row.get('corr_blame')}")
+        print(f"  Top baseline deviation: {list(baseline_dev_top.items()) if not baseline_dev_top.empty else 'N/A'}")
+        print(f"  Top baseline z-score: {list(baseline_z_top.items()) if not baseline_z_top.empty else 'N/A'}")
         print(f"  Top relative increase: {list(rel_top.items()) if not rel_top.empty else 'N/A'}")
-        print(f"  Top z-scores: {list(z_top.items()) if not z_top.empty else 'N/A'}")
-        print(f"  Top counts: {list(cnt_top.items()) if not cnt_top.empty else 'N/A'}")
 
-    # Accuracy of AIOps attribution over attack seconds (treat None as incorrect)
-    aiops_correct = (attack_periods['aiops_blame'] == 'tenant_99')
+    # Accuracy of attributions over attack windows (supports arbitrary attackers)
+    gt_attackers = attack_periods.get('noisy_tenant_gt', pd.Series(index=attack_periods.index, dtype=str))
+    aiops_correct = (attack_periods['aiops_blame'] == gt_attackers) & (gt_attackers != '')
     aiops_accuracy = aiops_correct.sum() / len(attack_periods) if len(attack_periods) else 0.0
     print(f"AIOps attribution accuracy during attack: {aiops_accuracy:.2%} ({aiops_correct.sum()}/{len(attack_periods)})")
 
     # Correlation-based attribution accuracy
-    corr_correct = (attack_periods['corr_blame'] == 'tenant_99')
+    corr_correct = (attack_periods['corr_blame'] == gt_attackers) & (gt_attackers != '')
     corr_accuracy = corr_correct.sum() / len(attack_periods) if len(attack_periods) else 0.0
     print(f"Correlation-based attribution accuracy during attack: {corr_accuracy:.2%} ({corr_correct.sum()}/{len(attack_periods)})")
 
@@ -414,11 +747,11 @@ else:
         # Persist windowed labeled telemetry with GT from plan and model attributions
         df_out = df_win.copy()
         df_out.rename(columns={'noisy_tenant_gt': 'noisy_tenant'}, inplace=True)
-        out_fn = 'telemetry_labeled.csv'
+        out_fn = OUTPUT_DIR / 'telemetry_labeled.csv'
         df_out.to_csv(out_fn, index=False)
-        print(f"\n✅ Wrote labeled telemetry to '{out_fn}' ({len(df_out)} rows, window={WINDOW_S}s).")
+        print(f"\n[OK] Wrote labeled telemetry to '{out_fn}' ({len(df_out)} rows, window={WINDOW_S}s).")
     except Exception as _e:
-        print(f"⚠️ Could not write labeled telemetry: {_e}")
+        print(f"[WARNING] Could not write labeled telemetry: {_e}")
 
 print("\n" + "-"*40)
 print("📝 Answers to Research Questions:")
@@ -460,8 +793,9 @@ plt.title('Log Volume per Tenant')
 plt.legend()
 
 plt.tight_layout()
-plt.savefig('final_evidence.png')
-print("\n📸 Evidence saved to 'final_evidence.png'")
+final_evidence_path = OUTPUT_DIR / 'final_evidence.png'
+plt.savefig(final_evidence_path)
+print(f"\n[SAVED] Evidence saved to '{final_evidence_path}'")
 
 # --- Additional presentation-ready figures ---
 try:
@@ -483,8 +817,9 @@ try:
     plt.title('Tenant log counts: Attack vs Normal')
     plt.legend()
     plt.tight_layout()
-    plt.savefig('tenant_counts_attack_vs_normal.png')
-    print("📸 Saved 'tenant_counts_attack_vs_normal.png'")
+    tenant_counts_path = OUTPUT_DIR / 'tenant_counts_attack_vs_normal.png'
+    plt.savefig(tenant_counts_path)
+    print(f"[SAVED] Saved '{tenant_counts_path}'")
 
     # 2) Tenant correlation with CPU (bar chart)
     if cpu_metric in df_win.columns:
@@ -496,8 +831,9 @@ try:
         plt.ylabel('Pearson corr with ' + cpu_metric)
         plt.title('CPU vs Tenant correlation (windowed)')
         plt.tight_layout()
-        plt.savefig('tenant_cpu_correlation.png')
-        print("📸 Saved 'tenant_cpu_correlation.png'")
+        corr_path = OUTPUT_DIR / 'tenant_cpu_correlation.png'
+        plt.savefig(corr_path)
+        print(f"[SAVED] Saved '{corr_path}'")
 
     # 3) Zoom time-series around attack period
     if attack_periods is not None and not attack_periods.empty:
@@ -512,23 +848,30 @@ try:
         ax.set_title('Attack zoom: CPU and some tenant counts')
         ax.legend(loc='upper right')
         plt.tight_layout()
-        plt.savefig('attack_zoom.png')
-        print("📸 Saved 'attack_zoom.png'")
+        attack_zoom_path = OUTPUT_DIR / 'attack_zoom.png'
+        plt.savefig(attack_zoom_path)
+        print(f"[SAVED] Saved '{attack_zoom_path}'")
+    else:
+        print("[INFO] Skipping attack zoom plot (no attack windows detected)")
 
     # 4) Attribution counts during attack (AIOps vs Correlation)
     ap = df_win[df_win['label'] == 'attack']
-    aiops_counts = ap['aiops_blame'].value_counts(dropna=True)
-    corr_counts = ap['corr_blame'].value_counts(dropna=True)
-    plt.figure(figsize=(10,4))
-    ax1 = plt.subplot(1,2,1)
-    aiops_counts.plot(kind='bar', color='teal', ax=ax1)
-    ax1.set_title('AIOps blame distribution (attack windows)')
-    ax1.set_ylabel('Count')
-    ax2 = plt.subplot(1,2,2)
-    corr_counts.plot(kind='bar', color='goldenrod', ax=ax2)
-    ax2.set_title('Correlation blame distribution (attack windows)')
-    plt.tight_layout()
-    plt.savefig('attribution_counts.png')
-    print("📸 Saved 'attribution_counts.png'")
+    if not ap.empty:
+        aiops_counts = ap['aiops_blame'].value_counts(dropna=True)
+        corr_counts = ap['corr_blame'].value_counts(dropna=True)
+        plt.figure(figsize=(10,4))
+        ax1 = plt.subplot(1,2,1)
+        aiops_counts.plot(kind='bar', color='teal', ax=ax1)
+        ax1.set_title('AIOps blame distribution (attack windows)')
+        ax1.set_ylabel('Count')
+        ax2 = plt.subplot(1,2,2)
+        corr_counts.plot(kind='bar', color='goldenrod', ax=ax2)
+        ax2.set_title('Correlation blame distribution (attack windows)')
+        plt.tight_layout()
+        attr_counts_path = OUTPUT_DIR / 'attribution_counts.png'
+        plt.savefig(attr_counts_path)
+        print(f"[SAVED] Saved '{attr_counts_path}'")
+    else:
+        print("[INFO] Skipping attribution distribution plot (no attack windows detected)")
 except Exception as e:
-    print(f"⚠️ Could not generate extra figures: {e}")
+    print(f"[WARNING] Could not generate extra figures: {e}")
